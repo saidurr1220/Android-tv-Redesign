@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 MDNS_ADDR = ("224.0.0.251", 5353)
@@ -238,6 +239,79 @@ def port_scan(subnet, timeout):
     return {ip: d for ip, d in devices.items() if tvish & set(d["services"])}
 
 
+# ------------------------------------------------------------ Samsung
+
+SSDP_ADDR = ("239.255.255.250", 1900)
+SAMSUNG_SSDP_TARGETS = ["urn:samsung.com:device:RemoteControlReceiver:1", "upnp:rootdevice"]
+
+
+def _ssdp_samsung(timeout):
+    """Return {ip: server_header} for SSDP responders that look like Samsung."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+    sock.settimeout(0.2)
+    found = {}
+    deadline = time.time() + timeout
+    next_send = 0.0
+    while time.time() < deadline:
+        if time.time() >= next_send:
+            for target in SAMSUNG_SSDP_TARGETS:
+                msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                       'MAN: "ssdp:discover"\r\nMX: 1\r\nST: %s\r\n\r\n' % target)
+                sock.sendto(msg.encode(), SSDP_ADDR)
+            next_send = time.time() + 1.0
+        try:
+            data, (src, _) = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        text = data.decode("utf-8", "replace")
+        if "samsung" in text.lower():
+            server = next((l.split(":", 1)[1].strip() for l in text.splitlines()
+                           if l.lower().startswith("server:")), "")
+            found[src] = server
+    sock.close()
+    return found
+
+
+def _samsung_info(ip, timeout):
+    """Ask the Tizen remote API (port 8001) who this is; None if it is not a Samsung TV."""
+    try:
+        with urllib.request.urlopen(f"http://{ip}:8001/api/v2/", timeout=timeout) as r:
+            info = json.load(r)
+    except (OSError, ValueError):
+        return None
+    device = info.get("device") if isinstance(info, dict) else None
+    if not isinstance(device, dict):
+        return None
+    return {
+        "name": device.get("name", ""),
+        "model": device.get("modelName", ""),
+        "power": device.get("PowerState", ""),
+        "api": info.get("version", ""),
+        "tizen": device.get("OS", ""),
+        "mac": device.get("wifiMac", ""),
+    }
+
+
+def samsung_discover(subnet, ssdp_timeout, port_timeout, scan=True):
+    candidates = set(_ssdp_samsung(ssdp_timeout))
+    if scan and subnet:
+        hosts = [str(h) for h in ipaddress.ip_network(subnet, strict=False).hosts()]
+        with ThreadPoolExecutor(max_workers=256) as pool:
+            for ip, is_open in zip(hosts, pool.map(lambda h: _probe(h, 8001, port_timeout), hosts)):
+                if is_open:
+                    candidates.add(ip)
+    devices = {}
+    for ip in candidates:
+        info = _samsung_info(ip, 2.0)
+        if info:
+            devices[ip] = {"ip": ip, "name": info["name"] or "Samsung TV", "model": info["model"],
+                           "services": {"samsung-remote": 8001}, "brand": "Samsung", "details": info}
+    return devices
+
+
 def cmd_discover(args):
     my_ip = local_ipv4()
     subnet = args.subnet or (f"{my_ip}/24" if my_ip else None)
@@ -249,15 +323,24 @@ def cmd_discover(args):
             merged = found.setdefault(ip, dev)
             merged["services"].update(dev["services"])
 
+    if not args.no_samsung:
+        for ip, dev in samsung_discover(subnet, args.mdns_timeout, args.port_timeout,
+                                        scan=not args.mdns_only).items():
+            found.setdefault(ip, dev).update(dev)
+
     if not found:
-        print("No Android TV devices found. Check that the TV is on and on the same network,")
+        print("No Android TV or Samsung TV devices found. Check that the TV is on and on the same network,")
         print("and that the network does not isolate clients (guest Wi-Fi often does).")
         return 1
     for dev in sorted(found.values(), key=lambda d: ipaddress.ip_address(d["ip"])):
         services = ", ".join(f"{k}:{v}" if v else k for k, v in dev["services"].items())
         name = dev["name"] or "(unnamed)"
         model = f" [{dev['model']}]" if dev["model"] else ""
-        print(f"  {dev['ip']:<15}  {name}{model}  ->  {services}")
+        extra = ""
+        if dev.get("brand") == "Samsung":
+            d = dev["details"]
+            extra = f"  (Samsung {d['tizen'] or 'Tizen'}, power {d['power']}, mac {d['mac']})"
+        print(f"  {dev['ip']:<15}  {name}{model}  ->  {services}{extra}")
     if args.json:
         print(json.dumps(list(found.values()), indent=2))
     return 0
@@ -378,11 +461,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("discover", help="find Android TVs on this network")
+    p = sub.add_parser("discover", help="find Android TVs and Samsung TVs on this network")
     p.add_argument("--subnet", help="CIDR to scan, default: this computer's /24")
     p.add_argument("--mdns-timeout", type=float, default=2.5, help="seconds to listen for mDNS replies")
     p.add_argument("--port-timeout", type=float, default=0.3, help="per-connection timeout for the port scan")
     p.add_argument("--mdns-only", action="store_true", help="skip the port scan")
+    p.add_argument("--no-samsung", action="store_true", help="skip the Samsung (Tizen) check")
     p.add_argument("--json", action="store_true", help="also print results as JSON")
     p.set_defaults(func=cmd_discover)
 

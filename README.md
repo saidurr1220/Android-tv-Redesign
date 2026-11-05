@@ -26,6 +26,15 @@ Discovery runs two methods together:
 
 Use `--subnet 10.0.0.0/24` to scan a different range or `--mdns-only` to skip the scan.
 
+### Samsung TVs
+
+Samsung TVs run Tizen, not Android, so the ADB steps below do not apply to
+them. `discover` also finds them: it listens for Samsung SSDP replies and
+checks port 8001, where most 2016+ Samsung TVs answer `/api/v2/` with the
+model name and power state. Use `--no-samsung` to skip this check. Some
+models or network setups don't answer; if yours is missing, check the
+TV's IP under Settings > General > Network > Network Status.
+
 ## 2. Enable network debugging on the TV
 
 Settings > Device Preferences > About > press **Build** 7 times, then
